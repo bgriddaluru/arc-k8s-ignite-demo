@@ -2,6 +2,7 @@
   "kindVersion": "v0.33.0",
   "helmVersion": "v3.17.3",
   "kubernetesVersion": "v1.32.2",
+  "toolsInstallerUrl": "https://gist.github.com/bgriddaluru/4845aede7595e6eb11180d99902daf24/raw/install-tools.sh",
   "clusterInstallerUrl": "https://gist.github.com/bgriddaluru/4845aede7595e6eb11180d99902daf24/raw/install-kind-cluster.sh",
   "arcOnboardingUrl": "https://gist.github.com/bgriddaluru/4845aede7595e6eb11180d99902daf24/raw/onboard-k8s-to-arc.sh"
 }
