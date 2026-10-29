@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
 # Requires Docker (Linux containers), kind >= 0.27.0, kubectl 1.32.x, and Helm 3.
-# Run as a user with Docker access. Historical versions are for demo use only.
+# Run as the administrator configured in /etc/arc-k8s-demo.json, without sudo.
+# Historical versions are for demo use only. Kubeconfig is shared at $HOME/.kube/config.
 set -Eeuo pipefail
 
-CLUSTER_NAME="compatibility-demo"
+export KUBECONFIG="$HOME/.kube/config"
 KUBERNETES_IMAGE="kindest/node:v1.32.2@sha256:f226345927d7e348497136874b6d207e0b32cc52154ad8323129352923a3142f"
 CALICO_VERSION="v3.29.3"
 ISTIO_VERSION="1.25.2"
 CERT_MANAGER_VERSION="v1.19.1"
 PROMETHEUS_CHART_VERSION="27.11.0" # Installs Prometheus v3.3.0.
-CONTEXT="kind-$CLUSTER_NAME"
 
 log() {
     printf '[%s] %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$*"
@@ -18,12 +18,25 @@ log() {
 trap 'rc=$?; log "ERROR at line $LINENO (exit $rc): $BASH_COMMAND" >&2; exit "$rc"' ERR
 
 log "Checking prerequisites."
-for tool in docker kind kubectl helm; do
+for tool in jq docker kind kubectl helm; do
     if ! command -v "$tool" >/dev/null 2>&1; then
         log "ERROR: $tool is missing. Install it before running this script." >&2
         exit 1
     fi
 done
+
+settings=/etc/arc-k8s-demo.json
+admin_user=$(jq -er '.adminUsername' "$settings")
+if [[ "$(id -un)" != "$admin_user" ]]; then
+    log "ERROR: Run this script as $admin_user without sudo so it uses the correct kubeconfig." >&2
+    exit 1
+fi
+CLUSTER_NAME=$(jq -er '.clusterName | select(type == "string" and length > 0)' "$settings")
+if [[ ! "$CLUSTER_NAME" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]]; then
+    log "ERROR: Invalid clusterName: use lowercase letters, digits and hyphens, starting and ending with a letter or digit." >&2
+    exit 1
+fi
+CONTEXT="kind-$CLUSTER_NAME"
 
 docker info
 if [[ "$(docker info --format '{{.OSType}}')" != "linux" ]]; then
@@ -58,7 +71,8 @@ done <<< "$existing_clusters"
 
 log "Creating Kubernetes 1.32.2: one control plane and two workers."
 # Do not wait for Ready here: nodes need Calico before they can become Ready.
-kind create cluster --name "$CLUSTER_NAME" --image "$KUBERNETES_IMAGE" --wait 0s --config - <<'YAML'
+mkdir -p "$HOME/.kube"
+kind create cluster --name "$CLUSTER_NAME" --image "$KUBERNETES_IMAGE" --kubeconfig "$KUBECONFIG" --wait 0s --config - <<'YAML'
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 nodes:
@@ -69,6 +83,15 @@ networking:
   disableDefaultCNI: true
   podSubnet: 192.168.0.0/16
 YAML
+
+chmod 0600 "$KUBECONFIG"
+node_names=$(kind get nodes --name "$CLUSTER_NAME")
+if [[ -z "$node_names" ]]; then
+    log "ERROR: No containers found for cluster $CLUSTER_NAME." >&2
+    exit 1
+fi
+readarray -t nodes <<< "$node_names"
+docker update --restart=unless-stopped "${nodes[@]}"
 
 log "Installing Calico $CALICO_VERSION as the only CNI."
 kubectl --context "$CONTEXT" create -f "https://raw.githubusercontent.com/projectcalico/calico/$CALICO_VERSION/manifests/tigera-operator.yaml"

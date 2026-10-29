@@ -31,6 +31,10 @@ param adminPassword string = 'Password1234'
 @maxLength(40)
 param clusterName string = 'arc-demo'
 
+@description('Raw HTTPS URL of arc-k8s-demo-settings.json uploaded to Gist. Deployment-specific values are supplied by Bicep and take precedence over downloaded settings.')
+@minLength(1)
+param settingsUrl string = 'https://gist.github.com/bgriddaluru/4845aede7595e6eb11180d99902daf24/raw/settings.json'
+
 @description('Optional tags shared by all resources.')
 param tags object = {}
 
@@ -39,18 +43,14 @@ var commonTags = union({
   workload: 'arc-k8s-demo'
 }, tags)
 
-// Keep kubectl and the kind node image on the same Kubernetes version.
-var bootstrapSettings = {
+var deploymentSettings = {
   adminUsername: adminUsername
   clusterName: clusterName
   subscriptionId: subscriptionId
   resourceGroupName: resourceGroupName
   location: location
   managedIdentityClientId: managedIdentity.properties.clientId
-  kindVersion: 'v0.33.0'
-  helmVersion: 'v4.3.1'
-  kubernetesVersion: 'v1.37.0'
-  nodeImage: 'kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5'
+  settingsUrl: settingsUrl
 }
 
 // Base64-encoded JSON keeps parameter values out of YAML and shell syntax.
@@ -65,11 +65,11 @@ packages:
   - jq
   - tar
 write_files:
-  - path: /etc/arc-k8s-demo.json
+  - path: /etc/arc-k8s-demo-deployment.json
     owner: root:root
     permissions: '0644'
     encoding: b64
-    content: __BOOTSTRAP_SETTINGS__
+    content: __DEPLOYMENT_SETTINGS__
   - path: /etc/apt/apt.conf.d/80-arc-k8s-demo-retries
     owner: root:root
     permissions: '0644'
@@ -114,11 +114,6 @@ write_files:
       }
 
       cluster_name=$(jq -er '.clusterName' "$settings")
-      node_image=$(jq -er '.nodeImage' "$settings")
-      subscription_id=$(jq -er '.subscriptionId' "$settings")
-      resource_group=$(jq -er '.resourceGroupName' "$settings")
-      location=$(jq -er '.location' "$settings")
-      identity_client_id=$(jq -er '.managedIdentityClientId' "$settings")
       export KUBECONFIG="$HOME/.kube/config"
       export AZURE_CONFIG_DIR="$HOME/.azure"
       export KIND_EXPERIMENTAL_PROVIDER=docker
@@ -128,23 +123,8 @@ write_files:
         exit 1
       fi
 
-      run_step "Checking Docker" docker info
-      run_step "Creating kind cluster $cluster_name" kind create cluster --name "$cluster_name" --image "$node_image" \
-        --kubeconfig "$KUBECONFIG" --wait 10m
-      run_step "Securing kubeconfig" chmod 0600 "$KUBECONFIG"
-      run_step "Selecting kind context" kubectl config use-context "kind-$cluster_name"
-      run_step "Enabling cluster container restart" docker update --restart=unless-stopped "$cluster_name-control-plane"
-      run_step "Waiting for Kubernetes nodes" kubectl wait --for=condition=Ready nodes --all --timeout=300s
-      run_step "Listing Kubernetes nodes" kubectl get nodes
-
-      run_step "Managed identity login" az login --identity --client-id "$identity_client_id" --output none
-      run_step "Selecting Azure subscription" az account set --subscription "$subscription_id"
-      run_step "Connecting cluster to Azure Arc" az connectedk8s connect --name "$cluster_name" --resource-group "$resource_group" \
-        --location "$location" --output none
-
-      run_step "Installing Kubernetes Upgrade Insights" az k8s-extension create --cluster-type connectedClusters --cluster-name "$cluster_name" \
-        --resource-group "$resource_group" --extension-type microsoft.kubernetesupgradeinsights \
-        --name k8s-upgrade-insights-ext --output none
+      run_step "Creating kind cluster $cluster_name" /usr/local/bin/install-kind-cluster.sh
+      run_step "Onboarding cluster to Azure Arc" /usr/local/bin/onboard-k8s-to-arc.sh
       echo "Arc onboarding and extension creation commands completed for $cluster_name."
   - path: /usr/local/sbin/arc-k8s-demo-bootstrap
     owner: root:root
@@ -156,13 +136,10 @@ write_files:
       exec > >(tee -a /var/log/arc-k8s-demo-bootstrap.log) 2>&1
       trap 'rc=$?; echo "Bootstrap failed at line $LINENO (exit $rc). See /var/log/arc-k8s-demo-bootstrap.log"; exit "$rc"' ERR
 
-      settings=/etc/arc-k8s-demo.json
-      admin_user=$(jq -er '.adminUsername' "$settings")
-      subscription_id=$(jq -er '.subscriptionId' "$settings")
-      identity_client_id=$(jq -er '.managedIdentityClientId' "$settings")
-      kind_version=$(jq -er '.kindVersion' "$settings")
-      helm_version=$(jq -er '.helmVersion' "$settings")
-      kubernetes_version=$(jq -er '.kubernetesVersion' "$settings")
+      deployment_settings=/etc/arc-k8s-demo-deployment.json
+      admin_user=$(jq -er '.adminUsername' "$deployment_settings")
+      subscription_id=$(jq -er '.subscriptionId' "$deployment_settings")
+      identity_client_id=$(jq -er '.managedIdentityClientId' "$deployment_settings")
       . /etc/os-release
       if [[ "$ID" != ubuntu || "$VERSION_ID" != 24.04 ]]; then
         echo "This bootstrap supports Ubuntu 24.04 only."
@@ -184,6 +161,31 @@ write_files:
         curl --fail --show-error --silent --location --retry 5 --retry-all-errors \
           --connect-timeout 20 --max-time 300 "$1" --output "$2"
       }
+
+      settings_url=$(jq -er '.settingsUrl' "$deployment_settings")
+      if [[ "$settings_url" != https://* ]]; then
+        echo "settingsUrl must be a raw HTTPS URL for the settings JSON." >&2
+        exit 1
+      fi
+      download "$settings_url" downloaded-settings.json
+      jq -e 'type == "object" and ([.kindVersion, .helmVersion, .kubernetesVersion, .clusterInstallerUrl, .arcOnboardingUrl] |
+        all(type == "string" and length > 0))' downloaded-settings.json > /dev/null
+      # Deployment values override any matching keys in the downloaded settings.
+      jq -s '.[0] + .[1] | del(.settingsUrl)' downloaded-settings.json "$deployment_settings" > merged-settings.json
+      settings=/etc/arc-k8s-demo.json
+      install -o root -g root -m 0644 merged-settings.json "$settings"
+      kind_version=$(jq -er '.kindVersion' "$settings")
+      helm_version=$(jq -er '.helmVersion' "$settings")
+      kubernetes_version=$(jq -er '.kubernetesVersion' "$settings")
+
+      cluster_installer_url=$(jq -er '.clusterInstallerUrl' "$settings")
+      arc_onboarding_url=$(jq -er '.arcOnboardingUrl' "$settings")
+      download "$cluster_installer_url" install-kind-cluster.sh
+      download "$arc_onboarding_url" onboard-k8s-to-arc.sh
+      bash -n install-kind-cluster.sh
+      bash -n onboard-k8s-to-arc.sh
+      install -o root -g root -m 0755 install-kind-cluster.sh /usr/local/bin/install-kind-cluster.sh
+      install -o root -g root -m 0755 onboard-k8s-to-arc.sh /usr/local/bin/onboard-k8s-to-arc.sh
 
       install -m 0755 -d /etc/apt/keyrings
       download https://download.docker.com/linux/ubuntu/gpg /etc/apt/keyrings/docker.asc
@@ -272,7 +274,7 @@ runcmd:
   - [bash, /usr/local/sbin/arc-k8s-demo-bootstrap]
 '''
 
-var cloudInit = replace(cloudInitTemplate, '__BOOTSTRAP_SETTINGS__', base64(string(bootstrapSettings)))
+var cloudInit = replace(cloudInitTemplate, '__DEPLOYMENT_SETTINGS__', base64(string(deploymentSettings)))
 
 resource managedIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
   name: '${vmName}-mi'
