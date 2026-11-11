@@ -28,7 +28,7 @@
             }
 
             $protectedSettings = @{
-                commandToExecute = "timeout 1800 cloud-init status --wait && runuser -l '$adminUsername' -c 'export KIND_EXPERIMENTAL_PROVIDER=docker; /usr/local/bin/install-kind-cluster.sh && /usr/local/bin/onboard-k8s-to-arc.sh'"
+                commandToExecute = "runuser -l '$adminUsername' -c 'export KIND_EXPERIMENTAL_PROVIDER=docker; /usr/local/bin/install-kind-cluster.sh && /usr/local/bin/onboard-k8s-to-arc.sh'"
             }
 
             Set-AzVMExtension `

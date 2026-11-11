@@ -9,10 +9,13 @@ param subscriptionId string = subscription().subscriptionId
 @description('Resource group for Arc onboarding. Defaults to the deployment resource group. If overridden, it must already exist and the managed identity needs access; this does not change the role assignment scope.')
 param resourceGroupName string = resourceGroup().name
 
+@description('Instance GUID used for naming resources.')
+param instanceGuid string = replace(newGuid(), '-', '')
+
 @description('Base name for the VM and related resources.')
 @minLength(1)
 @maxLength(48)
-param vmName string = 'arc-k8s-demo'
+param vmName string = 'arc-vm-${instanceGuid}'
 
 @description('An x64 VM size. Four vCPUs and 16 GiB RAM are recommended for this lab.')
 param vmSize string = 'Standard_D4s_v5'
@@ -28,8 +31,8 @@ param adminPassword string = 'Password1234'
 
 @description('Kind cluster name: lowercase letters, digits and hyphens; start and end with a letter or digit.')
 @minLength(1)
-@maxLength(40)
-param clusterName string = 'arc-demo'
+@maxLength(48)
+param clusterName string = 'arc-k8s-${instanceGuid}'
 
 @description('Raw HTTPS URL of arc-k8s-demo-settings.json uploaded to Gist. Deployment-specific values are supplied by Bicep and take precedence over downloaded settings.')
 @minLength(1)

@@ -2,6 +2,17 @@
 # Requires an existing kind cluster and the tools/settings installed by cloud-init.
 # Run as the configured administrator without sudo, after install-kind-cluster.sh.
 set -Eeuo pipefail
+
+umask 077
+execution_log_dir="$HOME/arc-k8s-demo-logs"
+mkdir -p "$execution_log_dir"
+chmod 0700 "$execution_log_dir"
+execution_log="$execution_log_dir/onboard-k8s-to-arc.log"
+touch "$execution_log"
+chmod 0600 "$execution_log"
+exec > >(tee -a "$execution_log") 2>&1
+printf '\n=== Arc onboarding started: %s ===\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+
 trap 'rc=$?; echo "Arc setup failed at line $LINENO (exit $rc)." >&2; exit "$rc"' ERR
 
 for tool in jq az kubectl; do
@@ -29,11 +40,13 @@ run_step() {
     shift
     step_number=$((step_number + 1))
     local step_log="$log_dir/step-$step_number.log"
-    echo "Running: $description"
+    printf '[%s] Running: %s\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$description"
     if "$@" >"$step_log" 2>&1; then
+        cat "$step_log" >>"$execution_log"
         echo "Completed: $description"
     else
         local rc=$?
+        cat "$step_log" >>"$execution_log"
         printf 'FAILED: %s (exit %s).\n' "$description" "$rc" >&2
         tail -c 2500 "$step_log" >&2
         printf '\nFull step log: %s\n' "$step_log" >&2

@@ -2,10 +2,21 @@
 # Requires Docker (Linux containers), kind >= 0.27.0, kubectl 1.32.x, and Helm 3.
 # Run as the administrator configured in /etc/arc-k8s-demo.json, without sudo.
 # Historical versions are for demo use only. Kubeconfig is shared at $HOME/.kube/config.
+# Existing kind clusters and Helm-managed Calico releases are reused.
 set -Eeuo pipefail
 
+umask 077
+log_dir="$HOME/arc-k8s-demo-logs"
+mkdir -p "$log_dir"
+chmod 0700 "$log_dir"
+execution_log="$log_dir/install-kind-cluster.log"
+touch "$execution_log"
+chmod 0600 "$execution_log"
+exec > >(tee -a "$execution_log") 2>&1
+printf '\n=== Cluster installation started: %s ===\n' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+
 export KUBECONFIG="$HOME/.kube/config"
-KUBERNETES_IMAGE="kindest/node:v1.32.2@sha256:f226345927d7e348497136874b6d207e0b32cc52154ad8323129352923a3142f"
+KUBERNETES_IMAGE="kindest/node:v1.32.2"
 CALICO_VERSION="v3.29.3"
 ISTIO_VERSION="1.25.2"
 CERT_MANAGER_VERSION="v1.19.1"
@@ -16,6 +27,9 @@ log() {
 }
 
 trap 'rc=$?; log "ERROR at line $LINENO (exit $rc): $BASH_COMMAND" >&2; exit "$rc"' ERR
+
+log "Waiting for cloud-init to finish."
+timeout 1800 cloud-init status --wait --long
 
 log "Checking prerequisites."
 for tool in jq docker kind kubectl helm; do
@@ -62,17 +76,22 @@ if [[ "$helm_version" != v3.* ]]; then
 fi
 
 existing_clusters="$(kind get clusters)"
+cluster_exists=false
 while IFS= read -r cluster; do
     if [[ "$cluster" == "$CLUSTER_NAME" ]]; then
-        log "ERROR: Cluster $CLUSTER_NAME already exists. This script will not replace it." >&2
-        exit 1
+        cluster_exists=true
+        break
     fi
 done <<< "$existing_clusters"
 
-log "Creating Kubernetes 1.32.2: one control plane and two workers."
-# Do not wait for Ready here: nodes need Calico before they can become Ready.
 mkdir -p "$HOME/.kube"
-kind create cluster --name "$CLUSTER_NAME" --image "$KUBERNETES_IMAGE" --kubeconfig "$KUBECONFIG" --wait 0s --config - <<'YAML'
+if "$cluster_exists"; then
+    log "Reusing existing cluster $CLUSTER_NAME and refreshing its kubeconfig."
+    kind export kubeconfig --name "$CLUSTER_NAME" --kubeconfig "$KUBECONFIG"
+else
+    log "Creating Kubernetes 1.32.2: one control plane and two workers."
+    # Do not wait for Ready here: nodes need Calico before they can become Ready.
+    kind create cluster --name "$CLUSTER_NAME" --image "$KUBERNETES_IMAGE" --kubeconfig "$KUBECONFIG" --wait 0s --config - <<'YAML'
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 nodes:
@@ -83,8 +102,18 @@ networking:
   disableDefaultCNI: true
   podSubnet: 192.168.0.0/16
 YAML
+fi
 
 chmod 0600 "$KUBECONFIG"
+kubectl config use-context "$CONTEXT"
+log "Checking Kubernetes API access for $CONTEXT."
+if kubectl --request-timeout=30s get --raw=/version >/dev/null; then
+    log "Kubernetes API is accessible."
+else
+    rc=$?
+    log "ERROR: Cannot access the API for $CONTEXT (exit $rc). Check the cluster containers and kubeconfig; this script will not delete or recreate the cluster." >&2
+    exit "$rc"
+fi
 node_names=$(kind get nodes --name "$CLUSTER_NAME")
 if [[ -z "$node_names" ]]; then
     log "ERROR: No containers found for cluster $CLUSTER_NAME." >&2
@@ -94,29 +123,44 @@ readarray -t nodes <<< "$node_names"
 docker update --restart=unless-stopped "${nodes[@]}"
 
 log "Installing Calico $CALICO_VERSION as the only CNI."
-kubectl --context "$CONTEXT" create -f "https://raw.githubusercontent.com/projectcalico/calico/$CALICO_VERSION/manifests/tigera-operator.yaml"
-kubectl --context "$CONTEXT" wait --for=condition=Established crd/installations.operator.tigera.io --timeout=120s
-kubectl --context "$CONTEXT" create -f "https://raw.githubusercontent.com/projectcalico/calico/$CALICO_VERSION/manifests/custom-resources.yaml"
-kubectl --context "$CONTEXT" wait --for=condition=Ready nodes --all --timeout=600s
-kubectl --context "$CONTEXT" rollout status daemonset/calico-node -n calico-system --timeout=300s
-kubectl --context "$CONTEXT" wait --for=condition=Available deployment --all -n calico-system --timeout=300s
-kubectl --context "$CONTEXT" rollout status deployment/coredns -n kube-system --timeout=300s
+helm upgrade --install calico tigera-operator \
+    --repo https://docs.tigera.io/calico/charts \
+    --version "$CALICO_VERSION" \
+    --namespace tigera-operator --create-namespace \
+    --atomic --timeout 10m --values - <<'YAML'
+installation:
+  enabled: true
+  calicoNetwork:
+    ipPools:
+    - name: default-ipv4-ippool
+      blockSize: 26
+      cidr: 192.168.0.0/16
+      encapsulation: VXLANCrossSubnet
+      natOutgoing: Enabled
+      nodeSelector: all()
+apiServer:
+  enabled: true
+YAML
+kubectl wait --for=condition=Ready nodes --all --timeout=600s
+kubectl rollout status daemonset/calico-node -n calico-system --timeout=300s
+kubectl wait --for=condition=Available deployment --all -n calico-system --timeout=300s
+kubectl rollout status deployment/coredns -n kube-system --timeout=300s
 
 log "Installing Istio $ISTIO_VERSION CRDs and control plane."
 helm upgrade --install istio-base base \
     --repo https://istio-release.storage.googleapis.com/charts \
-    --version "$ISTIO_VERSION" --kube-context "$CONTEXT" \
+    --version "$ISTIO_VERSION" \
     --namespace istio-system --create-namespace \
     --set defaultRevision=default --wait --timeout 10m
 helm upgrade --install istiod istiod \
     --repo https://istio-release.storage.googleapis.com/charts \
-    --version "$ISTIO_VERSION" --kube-context "$CONTEXT" \
+    --version "$ISTIO_VERSION" \
     --namespace istio-system --wait --timeout 10m
 
 log "Installing cert-manager $CERT_MANAGER_VERSION, including CRDs."
 helm upgrade --install cert-manager cert-manager \
     --repo https://charts.jetstack.io \
-    --version "$CERT_MANAGER_VERSION" --kube-context "$CONTEXT" \
+    --version "$CERT_MANAGER_VERSION" \
     --namespace cert-manager --create-namespace \
     --set crds.enabled=true --wait --timeout 10m
 
@@ -124,7 +168,7 @@ log "Installing Prometheus 3.3.0 (chart $PROMETHEUS_CHART_VERSION)."
 # Ephemeral storage and no optional add-ons keep the local demo small.
 helm upgrade --install prometheus prometheus \
     --repo https://prometheus-community.github.io/helm-charts \
-    --version "$PROMETHEUS_CHART_VERSION" --kube-context "$CONTEXT" \
+    --version "$PROMETHEUS_CHART_VERSION" \
     --namespace monitoring --create-namespace \
     --set server.persistentVolume.enabled=false \
     --set alertmanager.enabled=false \
@@ -134,12 +178,12 @@ helm upgrade --install prometheus prometheus \
     --wait --timeout 10m
 
 log "Verifying installed workloads."
-kubectl --context "$CONTEXT" rollout status deployment/istiod -n istio-system --timeout=300s
-kubectl --context "$CONTEXT" wait --for=condition=Available deployment --all -n cert-manager --timeout=300s
-kubectl --context "$CONTEXT" rollout status deployment/prometheus-server -n monitoring --timeout=300s
-kubectl --context "$CONTEXT" get nodes -o wide
-helm list --kube-context "$CONTEXT" --all-namespaces
-kubectl --context "$CONTEXT" get pods -A \
+kubectl rollout status deployment/istiod -n istio-system --timeout=300s
+kubectl wait --for=condition=Available deployment --all -n cert-manager --timeout=300s
+kubectl rollout status deployment/prometheus-server -n monitoring --timeout=300s
+kubectl get nodes -o wide
+helm list --all-namespaces
+kubectl get pods -A \
     -o 'custom-columns=NAMESPACE:.metadata.namespace,POD:.metadata.name,IMAGES:.spec.containers[*].image'
 
 log "Done. Cluster: $CLUSTER_NAME. Context: $CONTEXT."
