@@ -1,9 +1,17 @@
 #!/usr/bin/env bash
 # Requires Docker (Linux containers), kind >= 0.27.0, kubectl 1.32.x, and Helm 3.
-# Run as the administrator configured in /etc/arc-k8s-demo.json, without sudo.
-# Historical versions are for demo use only. Kubeconfig is shared at $HOME/.kube/config.
+# Run as root (or with sudo).
+# Historical versions are for demo use only. Kubeconfig is shared at /root/.kube/config.
 # Existing kind clusters and Helm-managed Calico releases are reused.
 set -Eeuo pipefail
+
+if (( EUID != 0 )); then
+    echo "Run this script as root (or with sudo) to install the cluster." >&2
+    exit 1
+fi
+
+export HOME=/root
+export KIND_EXPERIMENTAL_PROVIDER=docker
 
 umask 077
 log_dir="$HOME/arc-k8s-demo-logs"
@@ -29,7 +37,17 @@ log() {
 trap 'rc=$?; log "ERROR at line $LINENO (exit $rc): $BASH_COMMAND" >&2; exit "$rc"' ERR
 
 log "Waiting for cloud-init to finish."
-timeout 1800 cloud-init status --wait --long
+if timeout 1800 cloud-init status --wait --long; then
+    log "Cloud-init completed successfully."
+else
+    rc=$?
+    if (( rc == 2 )); then
+        log "WARNING: Cloud-init completed with recoverable errors (exit 2). Continuing with prerequisite checks; review the cloud-init status above."
+    else
+        log "ERROR: Cloud-init wait failed (exit $rc). Installation stopped; review the cloud-init status above and /var/log/cloud-init.log." >&2
+        exit "$rc"
+    fi
+fi
 
 log "Checking prerequisites."
 for tool in jq docker kind kubectl helm; do
@@ -40,11 +58,6 @@ for tool in jq docker kind kubectl helm; do
 done
 
 settings=/etc/arc-k8s-demo.json
-admin_user=$(jq -er '.adminUsername' "$settings")
-if [[ "$(id -un)" != "$admin_user" ]]; then
-    log "ERROR: Run this script as $admin_user without sudo so it uses the correct kubeconfig." >&2
-    exit 1
-fi
 CLUSTER_NAME=$(jq -er '.clusterName | select(type == "string" and length > 0)' "$settings")
 if [[ ! "$CLUSTER_NAME" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]]; then
     log "ERROR: Invalid clusterName: use lowercase letters, digits and hyphens, starting and ending with a letter or digit." >&2

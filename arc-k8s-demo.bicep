@@ -123,7 +123,7 @@ write_files:
       install -o root -g root -m 0755 onboard-k8s-to-arc.sh /usr/local/bin/onboard-k8s-to-arc.sh
 
       /usr/local/sbin/install-tools.sh
-      echo "VM preparation completed. Run install-kind-cluster.sh, then onboard-k8s-to-arc.sh as the configured administrator, without sudo."
+      echo "VM preparation completed. Run install-kind-cluster.sh, then onboard-k8s-to-arc.sh as root (or with sudo)."
 runcmd:
   - [bash, /usr/local/sbin/arc-k8s-demo-bootstrap]
 '''

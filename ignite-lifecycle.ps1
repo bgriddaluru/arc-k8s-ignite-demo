@@ -22,13 +22,8 @@
 
             Write-Host "Executing Kubernetes Arc onboarding on Linux VM '$($vm.Name)'."
 
-            $adminUsername = $vm.OSProfile.AdminUsername
-            if ([string]::IsNullOrWhiteSpace($adminUsername)) {
-                throw "Cannot determine the administrator username for VM '$($vm.Name)'."
-            }
-
             $protectedSettings = @{
-                commandToExecute = "runuser -l '$adminUsername' -c 'export KIND_EXPERIMENTAL_PROVIDER=docker; /usr/local/bin/install-kind-cluster.sh && /usr/local/bin/onboard-k8s-to-arc.sh'"
+                commandToExecute = "bash -c 'export HOME=/root KIND_EXPERIMENTAL_PROVIDER=docker; /usr/local/bin/install-kind-cluster.sh && /usr/local/bin/onboard-k8s-to-arc.sh'"
             }
 
             Set-AzVMExtension `

@@ -1,12 +1,19 @@
 # VM execution logs
 
 [ignite-lifecycle.ps1](./ignite-lifecycle.ps1) uses Custom Script Extension to
-execute cluster installation and Arc onboarding as the configured administrator.
+execute cluster installation and Arc onboarding as root, without switching users.
+Cloud-init also installs the tools and Azure CLI extensions as root. All three
+shell scripts require root and set `HOME=/root`, including when invoked with sudo.
+Kubeconfig is stored at `/root/.kube/config`; Azure CLI extensions and login state
+use `/root/.azure`. No Docker group membership is required for provisioning.
 The cluster script waits for cloud-init with
-`timeout 1800 cloud-init status --wait --long`, without sudo, after enabling its
-fixed log and before checking prerequisites. Nonzero exit codes stop installation,
-including cloud-init exit code 2 (recoverable errors), even when the status says
-`done`. Onboarding runs only if cluster installation succeeds.
+`timeout 1800 cloud-init status --wait --long`, as root, after enabling its
+fixed log and before checking prerequisites. Exit code 2 (recoverable errors)
+logs a warning and continues to prerequisite checks; the detailed cloud-init
+status remains in the cluster log. All other nonzero exit codes stop installation,
+including fatal errors (1) and the 30-minute wait timeout (124). Continuing does
+not repair bootstrap problems; missing tools or other unmet prerequisites still
+stop installation. Onboarding runs only if cluster installation succeeds.
 
 The cluster script must already have been downloaded before the lifecycle invokes
 it. Moving the wait into that script does not handle invocation before the script
@@ -21,15 +28,32 @@ For bootstrap problems, inspect `sudo cloud-init status --long`,
 `/var/log/cloud-init-output.log`, and `/var/log/cloud-init.log` on the VM.
 The tool installer also writes `/var/log/arc-k8s-demo-install-tools.log`.
 Arc onboarding retains its own step logs under
-`~/.local/state/onboard-k8s-to-arc/` and prints their location.
+`/root/.local/state/onboard-k8s-to-arc/` and prints their location.
 
 Cluster installation and onboarding also append stdout and stderr to fixed files
-under the executing administrator's home directory:
+under root's home directory:
 
 ```text
-~/arc-k8s-demo-logs/install-kind-cluster.log
-~/arc-k8s-demo-logs/onboard-k8s-to-arc.log
+/root/arc-k8s-demo-logs/install-kind-cluster.log
+/root/arc-k8s-demo-logs/onboard-k8s-to-arc.log
 ```
+
+An administrator with sudo privileges can debug without changing file permissions:
+
+```bash
+sudo docker ps
+sudo kind get clusters
+sudo kubectl --kubeconfig=/root/.kube/config get pods -A
+sudo tail -n 100 /root/arc-k8s-demo-logs/install-kind-cluster.log
+sudo tail -n 100 /root/arc-k8s-demo-logs/onboard-k8s-to-arc.log
+```
+
+Deploy the updated tool installer and both cluster/onboarding scripts together.
+On an existing VM prepared with the administrator-based installer, run the updated
+tool installer with sudo first to install Azure CLI extensions for root. Existing
+administrator-owned logs and Azure CLI state are not moved. With the same cluster
+name and Docker daemon, the cluster installer can reuse the existing kind cluster
+and export a fresh kubeconfig for root.
 
 Each run begins with a UTC timestamp. Cluster messages and onboarding step-start
 messages include timestamps; raw tool output is preserved without modification.

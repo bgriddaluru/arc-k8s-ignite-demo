@@ -8,12 +8,16 @@ if (( EUID != 0 )); then
     exit 1
 fi
 
+export HOME=/root
+export KUBECONFIG="$HOME/.kube/config"
+export AZURE_CONFIG_DIR="$HOME/.azure"
+export KIND_EXPERIMENTAL_PROVIDER=docker
+
 umask 022
 exec > >(tee -a /var/log/arc-k8s-demo-install-tools.log) 2>&1
 trap 'rc=$?; echo "Tool installation failed at line $LINENO (exit $rc). See /var/log/arc-k8s-demo-install-tools.log" >&2; exit "$rc"' ERR
 
 settings=/etc/arc-k8s-demo.json
-admin_user=$(jq -er '.adminUsername' "$settings")
 kind_version=$(jq -er '.kindVersion' "$settings")
 helm_version=$(jq -er '.helmVersion' "$settings")
 kubernetes_version=$(jq -er '.kubernetesVersion' "$settings")
@@ -28,10 +32,6 @@ if [[ "$arch" != amd64 ]]; then
     echo "Select an x64 VM size; this installer supports amd64 only." >&2
     exit 1
 fi
-admin_home=$(getent passwd "$admin_user" | cut -d: -f6)
-admin_group=$(id -gn "$admin_user")
-test -d "$admin_home"
-
 work_dir=$(mktemp -d)
 trap 'rm -rf -- "$work_dir"' EXIT
 cd "$work_dir"
@@ -72,8 +72,6 @@ for service_name in docker.service containerd.service; do
     systemctl is-active --quiet "$service_name"
     systemctl is-enabled --quiet "$service_name"
 done
-usermod -aG docker "$admin_user"
-
 download "https://github.com/kubernetes-sigs/kind/releases/download/$kind_version/kind-linux-$arch" kind
 download "https://github.com/kubernetes-sigs/kind/releases/download/$kind_version/kind-linux-$arch.sha256sum" kind.sha256sum
 echo "$(awk '{print $1}' kind.sha256sum)  kind" | sha256sum --check -
@@ -91,25 +89,19 @@ sha256sum --check helm.sha256sum
 tar -xzf "$helm_archive"
 install -o root -g root -m 0755 "linux-$arch/helm" /usr/local/bin/helm
 
-install -d -o "$admin_user" -g "$admin_group" -m 0700 "$admin_home/.kube"
-install -d -o "$admin_user" -g "$admin_group" -m 0700 "$admin_home/.azure"
-as_admin() {
-    runuser -u "$admin_user" -- env HOME="$admin_home" \
-        AZURE_CONFIG_DIR="$admin_home/.azure" KUBECONFIG="$admin_home/.kube/config" \
-        KIND_EXPERIMENTAL_PROVIDER=docker "$@"
-}
+install -d -o root -g root -m 0700 "$HOME/.kube" "$AZURE_CONFIG_DIR"
 
-as_admin docker info
-as_admin kind version
-as_admin kubectl version --client
-as_admin helm version --short
-as_admin az version
+docker info
+kind version
+kubectl version --client
+helm version --short
+az version
 
 for extension_name in connectedk8s k8s-extension; do
     echo "Installing Azure CLI extension: $extension_name"
-    as_admin az extension add --name "$extension_name" --upgrade --yes
-    as_admin az extension show --name "$extension_name" --query '{name:name, version:version}' --output json
+    az extension add --name "$extension_name" --upgrade --yes
+    az extension show --name "$extension_name" --query '{name:name, version:version}' --output json
 done
 
 echo "Tool installation completed. Docker and containerd are enabled and running."
-echo "Run cluster installation and Arc onboarding as $admin_user without sudo."
+echo "Run cluster installation and Arc onboarding as root (or with sudo)."

@@ -1,7 +1,14 @@
 #!/usr/bin/env bash
 # Requires an existing kind cluster and the tools/settings installed by cloud-init.
-# Run as the configured administrator without sudo, after install-kind-cluster.sh.
+# Run as root (or with sudo), after install-kind-cluster.sh.
 set -Eeuo pipefail
+
+if (( EUID != 0 )); then
+    echo "Run this script as root (or with sudo) to onboard the cluster to Arc." >&2
+    exit 1
+fi
+
+export HOME=/root
 
 umask 077
 execution_log_dir="$HOME/arc-k8s-demo-logs"
@@ -23,11 +30,6 @@ for tool in jq az kubectl; do
 done
 
 settings=/etc/arc-k8s-demo.json
-admin_user=$(jq -er '.adminUsername' "$settings")
-if [[ "$(id -un)" != "$admin_user" ]]; then
-    echo "Run this script as $admin_user without sudo so it uses the correct kubeconfig and Azure CLI configuration." >&2
-    exit 1
-fi
 
 umask 077
 mkdir -p "$HOME/.local/state/onboard-k8s-to-arc"
